@@ -60,6 +60,19 @@ class Event(ctypes.Structure):
         ("is_ipv6", ctypes.c_uint8),
     ]
 
+class TrafficKey(ctypes.Structure):
+    _fields_ = [
+        ("pid",     ctypes.c_uint32),
+        ("saddr",   ctypes.c_uint32),
+        ("daddr",   ctypes.c_uint32),
+        ("saddr6",  ctypes.c_uint8 * 16),
+        ("daddr6",  ctypes.c_uint8 * 16),
+        ("sport",   ctypes.c_uint16),
+        ("dport",   ctypes.c_uint16),
+        ("proto",   ctypes.c_uint8),
+        ("is_ipv6", ctypes.c_uint8),
+    ]
+
 class TrafficVal(ctypes.Structure):
     _fields_ = [
         ("sent_bytes", ctypes.c_uint64),
@@ -74,6 +87,15 @@ def fmt_ip(e: Event):
     else:
         src = socket.inet_ntoa(struct.pack("I", e.saddr))
         dst = socket.inet_ntoa(struct.pack("I", e.daddr))
+    return src, dst
+
+def fmt_traffic_ip(k: TrafficKey):
+    if k.is_ipv6:
+        src = socket.inet_ntop(socket.AF_INET6, bytes(k.saddr6))
+        dst = socket.inet_ntop(socket.AF_INET6, bytes(k.daddr6))
+    else:
+        src = socket.inet_ntoa(struct.pack("I", k.saddr))
+        dst = socket.inet_ntoa(struct.pack("I", k.daddr))
     return src, dst
 
 def fmt_bytes(b_val):
@@ -109,12 +131,12 @@ def on_event(cpu, data, size):
     if args.comm and args.comm not in name:  return
     if args.port and e.dport != args.port:   return
 
-    _, dst = fmt_ip(e)
+    src, dst = fmt_ip(e)
     proto  = "TCP" if e.proto == 6 else "UDP"
     host   = resolve(dst)
 
     proc_count[name] += 1
-    log.append((e.pid, name, proto, dst, e.dport, host))
+    log.append((e.pid, name, proto, src, e.sport, dst, e.dport, host))
 
 b["events"].open_perf_buffer(on_event, page_cnt=64)
 
@@ -122,7 +144,7 @@ def get_traffic_data():
     traffic_map = b["traffic_map"]
     data = {}
     for k, v in traffic_map.items():
-        pid = k.value
+        pid = k.pid
         name = v.comm.decode("utf-8", errors="replace").rstrip("\x00")
         if not name:
             name = f"pid_{pid}"
@@ -131,59 +153,90 @@ def get_traffic_data():
             continue
         if args.comm and args.comm not in name:
             continue
+        if args.port and k.dport != args.port:
+            continue
+
+        src, dst = fmt_traffic_ip(k)
+        sport = k.sport
+        dport = k.dport
+        proto = "TCP" if k.proto == 6 else "UDP"
 
         sent = v.sent_bytes
         recv = v.recv_bytes
         total = sent + recv
-        if name not in data:
-            data[name] = {"sent": 0, "recv": 0, "total": 0, "pids": set()}
-        data[name]["sent"] += sent
-        data[name]["recv"] += recv
-        data[name]["total"] += total
-        data[name]["pids"].add(pid)
+
+        key_id = (pid, src, sport, dst, dport, proto)
+        if key_id not in data:
+            data[key_id] = {
+                "pid": pid,
+                "name": name,
+                "proto": proto,
+                "src": src,
+                "sport": sport,
+                "dst": dst,
+                "dport": dport,
+                "sent": 0,
+                "recv": 0,
+                "total": 0
+            }
+        data[key_id]["sent"] += sent
+        data[key_id]["recv"] += recv
+        data[key_id]["total"] += total
     return data
 
 def build_table() -> Table:
     t = Table(show_header=True, header_style="bold", expand=True, show_lines=False, box=None)
-    t.add_column("PID",     style="dim",        width=8)
-    t.add_column("Process", style="bold white", width=16)
-    t.add_column("Proto",                       width=6)
-    t.add_column("Dest IP",                     width=20)
-    t.add_column("Port",                        width=7)
+    t.add_column("PID",     style="dim",        width=6)
+    t.add_column("Process", style="bold white", width=14)
+    t.add_column("Proto",                       width=5)
+    t.add_column("Src IP",                      width=16)
+    t.add_column("SPort",                       width=6)
+    t.add_column("Dest IP",                     width=16)
+    t.add_column("DPort",                       width=6)
     t.add_column("Host",    style="dim",        ratio=1)
 
-    for pid, name, proto, dst, port, host in reversed(log):
+    for pid, name, proto, src, sport, dst, dport, host in reversed(log):
         proto_text = Text(proto, style="cyan" if proto == "TCP" else "magenta")
-        port_text  = Text(str(port), style="red" if port < 1024 else "green")
-        t.add_row(str(pid), name, proto_text, dst, port_text, host or "")
+        sport_text = Text(str(sport), style="dim")
+        dport_text = Text(str(dport), style="red" if dport < 1024 else "green")
+        t.add_row(str(pid), name, proto_text, src, sport_text, dst, dport_text, host or "")
     return t
 
 def build_bandwidth_panel() -> Panel:
     traffic = get_traffic_data()
-    sorted_traffic = sorted(traffic.items(), key=lambda x: -x[1]["total"])[:6]
+    sorted_traffic = sorted(traffic.values(), key=lambda x: -x["total"])[:6]
     
     t = Table(show_header=True, header_style="bold cyan", expand=True, box=None, padding=(0, 2))
-    t.add_column("Process", style="bold white", width=16)
-    t.add_column("Sent", justify="right", width=12)
-    t.add_column("Received", justify="right", width=12)
-    t.add_column("Total BW", justify="right", width=12)
-    t.add_column("Status / Flag", width=20)
+    t.add_column("Process", style="bold white", width=12)
+    t.add_column("Src IP", width=15)
+    t.add_column("SP", width=5)
+    t.add_column("Dest IP", width=15)
+    t.add_column("DP", width=5)
+    t.add_column("Sent", justify="right", width=9)
+    t.add_column("Received", justify="right", width=9)
+    t.add_column("Total", justify="right", width=9)
+    t.add_column("Status", width=14)
 
     if not sorted_traffic:
         return Panel("[dim]waiting for bandwidth data...[/dim]", title="[bold]bandwidth usage & flags[/bold]", border_style="dim")
 
     has_flagged = False
-    for name, stats in sorted_traffic:
+    for stats in sorted_traffic:
         total = stats["total"]
         is_flagged = total > args.threshold
         if is_flagged:
             has_flagged = True
-            status = Text("⚠️ HIGH BANDWIDTH", style="bold red")
+            status = Text("⚠️ HIGH", style="bold red")
         else:
             status = Text("Normal", style="green")
         
+        dport_text = Text(str(stats["dport"]), style="red" if stats["dport"] < 1024 else "green")
         t.add_row(
-            name,
+            stats["name"],
+            stats["src"],
+            str(stats["sport"]),
+            stats["dst"],
+            dport_text,
             fmt_bytes(stats["sent"]),
             fmt_bytes(stats["recv"]),
             fmt_bytes(total),
@@ -191,7 +244,7 @@ def build_bandwidth_panel() -> Panel:
         )
 
     border_color = "yellow" if has_flagged else "dim"
-    return Panel(t, title="[bold]bandwidth usage & high-usage flags[/bold]", border_style=border_color)
+    return Panel(t, title="[bold]bandwidth usage per connection (Src/Dest IP & Port)[/bold]", border_style=border_color)
 
 def build_display():
     return Group(build_table(), build_bandwidth_panel())
@@ -206,8 +259,8 @@ except KeyboardInterrupt:
 
 total = sum(proc_count.values())
 console.print(f"\n[bold]KConnect stopped.[/bold] Captured {total} connections.\n")
-console.print("[bold]Final bandwidth summary:[/bold]")
+console.print("[bold]Final bandwidth summary (by connection):[/bold]")
 traffic = get_traffic_data()
-for name, stats in sorted(traffic.items(), key=lambda x: -x[1]["total"])[:10]:
-    flag = " [bold red]⚠️ FLAGGED (Excessive Bandwidth)[/bold red]" if stats["total"] > args.threshold else ""
-    console.print(f"  [cyan]{name:<20}[/cyan] Sent: {fmt_bytes(stats['sent'])}, Recv: {fmt_bytes(stats['recv'])}, Total: {fmt_bytes(stats['total'])}{flag}")
+for stats in sorted(traffic.values(), key=lambda x: -x["total"])[:10]:
+    flag = " [bold red]⚠️ FLAGGED[/bold red]" if stats["total"] > args.threshold else ""
+    console.print(f"  [cyan]{stats['name']:<14}[/cyan] Src: {stats['src']}:{stats['sport']} -> Dest: {stats['dst']}:{stats['dport']} | Total: {fmt_bytes(stats['total'])}{flag}")
