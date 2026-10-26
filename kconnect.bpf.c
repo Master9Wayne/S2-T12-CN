@@ -1,4 +1,4 @@
-
+/* Dummy struct to fix BCC compilation on newer kernels */
 struct bpf_wq {};
 
 #include <uapi/linux/ptrace.h>  
@@ -29,6 +29,18 @@ struct conn_key_t {
     u8   pad;           
 };
 
+struct traffic_key_t {
+    u32  pid;
+    u32  saddr;
+    u32  daddr;         
+    u8   saddr6[16];
+    u8   daddr6[16];    
+    u16  sport;
+    u16  dport;
+    u8   proto;
+    u8   is_ipv6;       
+};
+
 struct traffic_val_t {
     u64 sent_bytes;
     u64 recv_bytes;
@@ -37,7 +49,7 @@ struct traffic_val_t {
 
 BPF_PERF_OUTPUT(events);
 BPF_HASH(seen, struct conn_key_t, u8);
-BPF_HASH(traffic_map, u32, struct traffic_val_t);
+BPF_HASH(traffic_map, struct traffic_key_t, struct traffic_val_t);
 
 static __always_inline int is_new_conn(u32 pid, u32 daddr,
                                         u8 *daddr6, u16 dport, u8 proto)
@@ -59,13 +71,38 @@ static __always_inline int is_new_conn(u32 pid, u32 daddr,
     return 1;                          
 }
 
-static __always_inline void update_traffic(u32 pid, u64 sent, u64 recv) {
-    if (pid == 0) return;
+static __always_inline void update_traffic(struct sock *sk, u64 sent, u64 recv, u8 proto) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid == 0 || !sk) return;
+
+    u16 family = 0;
+    bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+    if (family != AF_INET && family != AF_INET6) return;
+
+    struct traffic_key_t k = {};
+    k.pid = pid;
+    k.proto = proto;
+    k.sport = sk->__sk_common.skc_num;
+
+    u16 dp = 0;
+    bpf_probe_read_kernel(&dp, sizeof(dp), &sk->__sk_common.skc_dport);
+    k.dport = ntohs(dp);
+
+    if (family == AF_INET) {
+        bpf_probe_read_kernel(&k.saddr, sizeof(k.saddr), &sk->__sk_common.skc_rcv_saddr);
+        bpf_probe_read_kernel(&k.daddr, sizeof(k.daddr), &sk->__sk_common.skc_daddr);
+        k.is_ipv6 = 0;
+    } else if (family == AF_INET6) {
+        bpf_probe_read_kernel(&k.saddr6, sizeof(k.saddr6), &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+        bpf_probe_read_kernel(&k.daddr6, sizeof(k.daddr6), &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr8);
+        k.is_ipv6 = 1;
+    }
+
     struct traffic_val_t *val, zero = {};
-    val = traffic_map.lookup(&pid);
+    val = traffic_map.lookup(&k);
     if (!val) {
-        traffic_map.update(&pid, &zero);
-        val = traffic_map.lookup(&pid);
+        traffic_map.update(&k, &zero);
+        val = traffic_map.lookup(&k);
         if (!val) return;
         bpf_get_current_comm(&val->comm, sizeof(val->comm));
     }
@@ -142,7 +179,7 @@ int trace_udp4(struct pt_regs *ctx, struct sock *sk,
                struct msghdr *msg, size_t len)
 {
     fill_and_submit(ctx, sk, IPPROTO_UDP);
-    update_traffic(bpf_get_current_pid_tgid() >> 32, len, 0);
+    update_traffic(sk, len, 0, IPPROTO_UDP);
     return 0;
 }
 
@@ -150,21 +187,19 @@ int trace_udp6(struct pt_regs *ctx, struct sock *sk,
                struct msghdr *msg, size_t len)
 {
     fill_and_submit(ctx, sk, IPPROTO_UDP);
-    update_traffic(bpf_get_current_pid_tgid() >> 32, len, 0);
+    update_traffic(sk, len, 0, IPPROTO_UDP);
     return 0;
 }
 
 int trace_tcp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t size)
 {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    update_traffic(pid, size, 0);
+    update_traffic(sk, size, 0, IPPROTO_TCP);
     return 0;
 }
 
 int trace_tcp_cleanup_rbuf(struct pt_regs *ctx, struct sock *sk, int copied)
 {
     if (copied <= 0) return 0;
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    update_traffic(pid, 0, (u64)copied);
+    update_traffic(sk, 0, (u64)copied, IPPROTO_TCP);
     return 0;
 }
